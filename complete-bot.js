@@ -301,8 +301,8 @@ function generateTicketId(userId) {
   return ticketId;
 }
 
-// Função para criar um novo ticket
-function createTicket(userId, username, firstName, subject, description) {
+// Modificar a função createTicket para suportar imagens
+function createTicket(userId, username, firstName, subject, description, imageUrl = null) {
   console.log(`Criando ticket para usuário: ${userId}`);
   
   // Verificar se o usuário já tem um ticket ativo
@@ -327,6 +327,7 @@ function createTicket(userId, username, firstName, subject, description) {
       {
         sender: 'user',
         content: description,
+        imageUrl: imageUrl,
         timestamp: new Date().toISOString()
       }
     ]
@@ -532,14 +533,15 @@ async function syncWithDiscord() {
   }
 }
 
-// Função para adicionar mensagem a um ticket
-function addMessage(ticketId, sender, content) {
+// Modificar a função addMessage para suportar imagens
+function addMessage(ticketId, sender, content, imageUrl = null) {
   const ticket = activeTickets.find(t => t.id === ticketId);
   if (!ticket) return null;
   
   ticket.messages.push({
     sender,
     content,
+    imageUrl,
     timestamp: new Date().toISOString()
   });
   
@@ -628,7 +630,15 @@ async function sendToTelegramAPI(userId, message, ticketId, options = {}) {
     const lang = getUserLanguage(userId);
     
     // Preparar a mensagem
-    let text = getTranslation('supportReply', lang, escapeMarkdown(ticketId), escapeMarkdown(message));
+    let text = '';
+    
+    // Se for uma mensagem de fechamento, manter o formato original
+    if (options.isClosingMessage) {
+      text = getTranslation('supportReply', lang, escapeMarkdown(ticketId), escapeMarkdown(message));
+    } else {
+      // Caso contrário, usar o formato simplificado
+      text = `OrcMine Support: ${escapeMarkdown(message)}`;
+    }
     
     // Configurar o teclado com botões, se necessário
     let keyboard = undefined;
@@ -665,7 +675,9 @@ async function sendToTelegramAPI(userId, message, ticketId, options = {}) {
       
       // Tentar enviar sem formatação
       try {
-        const plainText = `Support:\n\n${message}\n\n`;
+        const plainText = options.isClosingMessage 
+          ? `Support:\n\n${message}\n\n` 
+          : `OrcMine Support: ${message}`;
         
         const response = await axios.post(`${TELEGRAM_API_URL}/sendMessage`, {
           chat_id: userId,
@@ -1403,10 +1415,26 @@ discordClient.on('messageCreate', async (message) => {
       return;
     }
     
+    // Verificar se a mensagem contém anexos (imagens)
+    const hasAttachments = message.attachments.size > 0;
+    let imageUrl = null;
+    
+    if (hasAttachments) {
+      // Pegar o primeiro anexo
+      const attachment = message.attachments.first();
+      
+      // Verificar se é uma imagem
+      if (attachment.contentType && attachment.contentType.startsWith('image/')) {
+        imageUrl = attachment.url;
+        console.log(`Imagem detectada: ${imageUrl}`);
+      }
+    }
+    
     // Adicionar a mensagem ao ticket
     ticket.messages.push({
       sender: 'support',
-      content: message.content,
+      content: message.content || (imageUrl ? 'Imagem enviada pelo suporte' : ''),
+      imageUrl: imageUrl,
       timestamp: new Date().toISOString(),
       discordUserId: message.author.id,
       discordUsername: message.author.username
@@ -1414,7 +1442,15 @@ discordClient.on('messageCreate', async (message) => {
     saveActiveTickets();
     
     // Enviar a mensagem para o usuário no Telegram
-    const success = await sendToTelegramAPI(ticket.userId, message.content, ticketId, { isClosingMessage: false });
+    let success = false;
+    
+    if (imageUrl) {
+      // Se tiver imagem, enviar a imagem
+      success = await sendImageToTelegram(ticket.userId, imageUrl, message.content, ticketId);
+    } else {
+      // Se for apenas texto, enviar o texto
+      success = await sendToTelegramAPI(ticket.userId, message.content, ticketId, { isClosingMessage: false });
+    }
     
     // Reagir à mensagem para indicar sucesso ou falha
     if (success) {
@@ -1778,3 +1814,350 @@ telegramBot.action(/cancel_close_(.+)/, async (ctx) => {
     await ctx.answerCbQuery('Error cancelling');
   }
 });
+
+// Adicionar manipulador para mensagens com fotos
+telegramBot.on('photo', async (ctx) => {
+  console.log('Photo message received');
+  
+  const userId = ctx.from.id;
+  const lang = getUserLanguage(userId);
+  const session = userSessions[userId];
+  
+  // Se não há sessão ativa, verificar se o usuário tem um ticket ativo
+  if (!session) {
+    const activeTicket = activeTickets.find(t => t.userId === userId.toString() && t.status === 'open');
+    
+    if (activeTicket) {
+      // Configurar sessão para responder ao ticket ativo
+      userSessions[userId] = { state: 'replying', ticketId: activeTicket.id };
+      
+      // Processar a foto como uma resposta ao ticket
+      return processPhotoReply(ctx, activeTicket);
+    } else {
+      // Sem sessão e sem ticket ativo
+      return ctx.reply(getTranslation('useNewTicket', lang));
+    }
+  }
+  
+  // Processar com base no estado da sessão
+  switch (session.state) {
+    case 'awaiting_description':
+      // Usuário está enviando uma foto como descrição do ticket
+      try {
+        // Obter o array de fotos (diferentes tamanhos)
+        const photoSizes = ctx.message.photo;
+        
+        // Pegar a foto com maior resolução (último item do array)
+        const photo = photoSizes[photoSizes.length - 1];
+        
+        // Obter o arquivo da foto
+        const fileId = photo.file_id;
+        const fileInfo = await ctx.telegram.getFile(fileId);
+        const fileUrl = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${fileInfo.file_path}`;
+        
+        console.log(`Foto recebida como descrição, URL: ${fileUrl}`);
+        
+        // Obter legenda da foto, se houver
+        const caption = ctx.message.caption || 'Imagem enviada como descrição';
+        
+        // Criar o ticket com a imagem
+        const result = createTicket(
+          userId,
+          ctx.from.username,
+          ctx.from.first_name,
+          session.subject,
+          caption,
+          fileUrl
+        );
+        
+        // Verificar se houve erro na criação do ticket
+        if (result.error === 'already_has_ticket') {
+          // Informar ao usuário que ele já tem um ticket ativo
+          const existingTicket = result.ticket;
+          const ticketInfo = `*Ticket #${escapeMarkdown(existingTicket.id)}: ${escapeMarkdown(existingTicket.subject)}*`;
+          const message = getTranslation('alreadyHasTicket', lang);
+          
+          try {
+            await ctx.reply(`${message}\n\n${ticketInfo}`, { 
+              parse_mode: 'MarkdownV2',
+              ...Markup.inlineKeyboard([
+                [Markup.button.callback(getTranslation('closeTicketButton', lang), `direct_close_${existingTicket.id}`)]
+              ])
+            });
+          } catch (error) {
+            console.error('Error sending ticket info:', error);
+            await ctx.reply(message.replace(/\*/g, '') + ` (#${existingTicket.id})`);
+          }
+          
+          // Definir o ticket ativo para o usuário
+          userSessions[userId] = { state: 'replying', ticketId: existingTicket.id };
+          
+          return;
+        }
+        
+        const ticket = result.ticket;
+        
+        // Configurar sessão para responder ao novo ticket
+        userSessions[userId] = { state: 'replying', ticketId: ticket.id };
+        
+        // Confirmar criação
+        try {
+          const ticketCreatedMessage = getTranslation(
+            'ticketCreated', 
+            lang, 
+            escapeMarkdown(ticket.id), 
+            escapeMarkdown(ticket.subject)
+          );
+          
+          // Adicionar botão para fechar o ticket
+          const closeButtonText = getTranslation('closeTicketButton', lang);
+          
+          await ctx.reply(ticketCreatedMessage, { 
+            parse_mode: 'MarkdownV2',
+            ...Markup.inlineKeyboard([
+              [Markup.button.callback(closeButtonText, `direct_close_${ticket.id}`)]
+            ])
+          });
+        } catch (markdownError) {
+          console.error('Error sending ticket created message with MarkdownV2:', markdownError);
+          // Tentar sem formatação
+          await ctx.reply(`Ticket #${ticket.id} "${ticket.subject}" has been created!\n\nYou can reply directly to this chat to respond to the ticket.`, {
+            ...Markup.inlineKeyboard([
+              [Markup.button.callback(getTranslation('closeTicketButton', lang), `direct_close_${ticket.id}`)]
+            ])
+          });
+        }
+        
+        // Enviar para o Discord
+        await sendImageToDiscord(ticket, fileUrl, caption, true);
+      } catch (error) {
+        console.error('Error creating ticket with image:', error);
+        await ctx.reply(getTranslation('errorCreatingTicket', lang));
+      }
+      break;
+      
+    case 'replying':
+      // Usuário está respondendo a um ticket ativo com uma foto
+      const ticketId = session.ticketId;
+      const ticket = activeTickets.find(t => t.id === ticketId);
+      
+      if (!ticket) {
+        delete userSessions[userId];
+        return ctx.reply(getTranslation('ticketNotFound', lang));
+      }
+      
+      return processPhotoReply(ctx, ticket);
+      
+    default:
+      // Estado desconhecido, limpar sessão
+      delete userSessions[userId];
+      await ctx.reply(getTranslation('useNewTicket', lang));
+  }
+});
+
+// Função auxiliar para processar fotos como respostas a tickets
+async function processPhotoReply(ctx, ticket) {
+  const userId = ctx.from.id;
+  const lang = getUserLanguage(userId);
+  
+  try {
+    // Obter o array de fotos (diferentes tamanhos)
+    const photoSizes = ctx.message.photo;
+    
+    // Pegar a foto com maior resolução (último item do array)
+    const photo = photoSizes[photoSizes.length - 1];
+    
+    // Obter o arquivo da foto
+    const fileId = photo.file_id;
+    const fileInfo = await ctx.telegram.getFile(fileId);
+    const fileUrl = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${fileInfo.file_path}`;
+    
+    console.log(`Foto recebida como resposta, URL: ${fileUrl}`);
+    
+    // Obter legenda da foto, se houver
+    const caption = ctx.message.caption || 'Imagem enviada pelo usuário';
+    
+    // Adicionar mensagem ao ticket
+    ticket.messages.push({
+      sender: 'user',
+      content: caption,
+      imageUrl: fileUrl,
+      timestamp: new Date().toISOString()
+    });
+    saveActiveTickets();
+    
+    // Confirmar envio
+    await ctx.reply(getTranslation('messageSent', lang));
+    
+    // Enviar para o Discord
+    await sendImageToDiscord(ticket, fileUrl, caption, false);
+    
+    return true;
+  } catch (error) {
+    console.error('Error processing photo reply:', error);
+    await ctx.reply('Erro ao processar a imagem. Por favor, tente novamente.');
+    return false;
+  }
+}
+
+// Função para enviar imagem para o Discord
+async function sendImageToDiscord(ticket, imageUrl, message, isNewTicket = false) {
+  try {
+    console.log(`Sending image to Discord (Ticket #${ticket.id}): ${imageUrl}`);
+    
+    // Verificar se o ticket está fechado
+    if (ticket.status === 'closed') {
+      console.log(`Ticket #${ticket.id} is closed, not sending to Discord`);
+      return false;
+    }
+    
+    let channel;
+    
+    // Se o ticket já tem um canal associado, usar esse canal
+    if (ticket.discordChannelId) {
+      try {
+        channel = await discordClient.channels.fetch(ticket.discordChannelId);
+      } catch (error) {
+        console.error(`Error fetching channel ${ticket.discordChannelId}:`, error);
+        channel = null;
+      }
+    }
+    
+    // Se não tem canal ou não foi possível recuperar, criar um novo
+    if (!channel && isNewTicket) {
+      channel = await createTicketChannel(ticket);
+    }
+    
+    // Se ainda não tem canal, enviar para o canal padrão
+    if (!channel && DISCORD_CHANNEL_ID) {
+      try {
+        channel = await discordClient.channels.fetch(DISCORD_CHANNEL_ID);
+      } catch (error) {
+        console.error(`Error fetching default channel ${DISCORD_CHANNEL_ID}:`, error);
+        return false;
+      }
+    }
+    
+    // Se não foi possível obter um canal, falhar
+    if (!channel) {
+      console.error('No Discord channel available for sending message');
+      return false;
+    }
+    
+    // Baixar a imagem
+    const response = await axios.get(imageUrl, { responseType: 'arraybuffer' });
+    const buffer = Buffer.from(response.data, 'binary');
+    
+    // Criar um nome de arquivo baseado no ID do ticket e timestamp
+    const timestamp = new Date().getTime();
+    const filename = `ticket_${ticket.id}_${timestamp}.jpg`;
+    
+    // Criar embed com a imagem
+    const embed = new EmbedBuilder()
+      .setTitle(`Image from Ticket #${ticket.id}`)
+      .setDescription(message || 'Image sent by user')
+      .setColor(0x00AE86)
+      .setFooter({ text: `From: ${ticket.username} (${ticket.userId})` })
+      .setImage(`attachment://${filename}`)
+      .setTimestamp();
+    
+    // Enviar a mensagem com a imagem anexada
+    await channel.send({
+      embeds: [embed],
+      files: [{
+        attachment: buffer,
+        name: filename
+      }]
+    });
+    
+    return true;
+  } catch (error) {
+    console.error('Error sending image to Discord:', error);
+    return false;
+  }
+}
+
+// Função para enviar imagem para o Telegram
+async function sendImageToTelegram(userId, imageUrl, caption, ticketId) {
+  try {
+    console.log(`Sending image to Telegram (${userId}): ${imageUrl}`);
+    
+    // Verificar se o userId é válido
+    if (!userId) {
+      console.error('Invalid Telegram user ID');
+      return false;
+    }
+    
+    // Obter o idioma do usuário
+    const lang = getUserLanguage(userId);
+    
+    // Preparar a legenda
+    let text = '';
+    if (caption && caption.trim() !== '') {
+      // Se tiver legenda, usar apenas "OrcMine Support:" seguido da mensagem
+      text = `OrcMine Support: ${caption}`;
+    } else {
+      // Se não tiver legenda, usar apenas "OrcMine Support:"
+      text = "OrcMine Support:";
+    }
+    
+    // Configurar o teclado com botões, se necessário
+    let keyboard = undefined;
+    
+    // Adicionar botão para fechar o ticket
+    const closeButtonText = getTranslation('closeTicketButton', lang);
+    
+    keyboard = {
+      inline_keyboard: [
+        [
+          { text: closeButtonText, callback_data: `direct_close_${ticketId}` }
+        ]
+      ]
+    };
+    
+    // Enviar a imagem
+    try {
+      const response = await axios.post(`${TELEGRAM_API_URL}/sendPhoto`, {
+        chat_id: userId,
+        photo: imageUrl,
+        caption: text,
+        reply_markup: keyboard
+      });
+      
+      if (response.data && response.data.ok) {
+        console.log(`Image sent successfully to Telegram API (${userId})`);
+        return true;
+      } else {
+        console.error('Error in Telegram API response:', response.data);
+        return false;
+      }
+    } catch (error) {
+      console.error('Error sending image to Telegram:', error.response ? error.response.data : error.message);
+      
+      // Se falhar ao enviar a imagem, enviar apenas uma mensagem de erro sem o link da imagem
+      try {
+        const errorMessage = `OrcMine Support: ${getTranslation('imageFailedToSend', lang) || 'Não foi possível enviar a imagem.'}`;
+        
+        const response = await axios.post(`${TELEGRAM_API_URL}/sendMessage`, {
+          chat_id: userId,
+          text: errorMessage,
+          reply_markup: keyboard
+        });
+        
+        if (response.data && response.data.ok) {
+          console.log(`Error message sent successfully to Telegram API (${userId})`);
+          return true;
+        } else {
+          console.error('Error in Telegram API response for error message:', response.data);
+          return false;
+        }
+      } catch (errorMessageError) {
+        console.error('Error sending error message:', errorMessageError.response ? errorMessageError.response.data : errorMessageError.message);
+        return false;
+      }
+    }
+  } catch (error) {
+    console.error('Error in sendImageToTelegram:', error);
+    return false;
+  }
+}
